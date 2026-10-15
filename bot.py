@@ -3,7 +3,7 @@ import logging
 import math
 import os
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -114,6 +114,36 @@ def parse_amount(text):
     return round(v, 2)
 
 
+def parse_date(text):
+    parts = text.strip().replace("/", ".").replace("-", ".").split(".")
+    today = now().date()
+    try:
+        if len(parts) == 2:
+            d, m, y = int(parts[0]), int(parts[1]), today.year
+        elif len(parts) == 3:
+            a, b, c = parts
+            if len(a) == 4:
+                y, m, d = int(a), int(b), int(c)
+            else:
+                d, m, y = int(a), int(b), int(c)
+                if y < 100:
+                    y += 2000
+        else:
+            return None
+        res = date(y, m, d)
+    except ValueError:
+        return None
+    if res > today:
+        return None
+    return res
+
+
+def human_date(iso):
+    if not iso:
+        return "сегодня"
+    return date.fromisoformat(iso).strftime("%d.%m.%Y")
+
+
 def period_start(code):
     n = now().replace(hour=0, minute=0, second=0, microsecond=0)
     if code == "week":
@@ -190,6 +220,7 @@ def cats_kb(kind, prefix):
 class TxFlow(StatesGroup):
     amount = State()
     note = State()
+    date = State()
 
 
 class CatFlow(StatesGroup):
@@ -243,9 +274,79 @@ async def cb_tx(cb: CallbackQuery, state: FSMContext):
         return
     c = rows[0]
     await state.set_state(TxFlow.amount)
-    await state.update_data(cat_id=c["id"], kind=c["kind"], cat_name=c["name"])
-    cancel = InlineKeyboardMarkup(inline_keyboard=[[BACK]])
-    await show(cb, f"{c['name']}\n\nВведите сумму:", cancel)
+    await state.update_data(
+        cat_id=c["id"], kind=c["kind"], cat_name=c["name"], date=None
+    )
+    d = await state.get_data()
+    await show(cb, amount_text(d), amount_kb(d))
+
+
+def amount_text(d):
+    return f"{d['cat_name']}\n📅 Дата: {human_date(d.get('date'))}\n\nВведите сумму:"
+
+
+def amount_kb(d):
+    row = [
+        InlineKeyboardButton(text="📅 Вчера", callback_data="date:yesterday"),
+        InlineKeyboardButton(text="📅 Другая дата", callback_data="date:custom"),
+    ]
+    rows = [row]
+    if d.get("date"):
+        rows.append(
+            [InlineKeyboardButton(text="📅 Сегодня", callback_data="date:today")]
+        )
+    rows.append([BACK])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data == "date:yesterday", TxFlow.amount)
+async def cb_yesterday(cb: CallbackQuery, state: FSMContext):
+    y = (now().date() - timedelta(days=1)).isoformat()
+    await state.update_data(date=y)
+    d = await state.get_data()
+    await show(cb, amount_text(d), amount_kb(d))
+
+
+@router.callback_query(F.data == "date:today", TxFlow.amount)
+async def cb_today(cb: CallbackQuery, state: FSMContext):
+    await state.update_data(date=None)
+    d = await state.get_data()
+    await show(cb, amount_text(d), amount_kb(d))
+
+
+@router.callback_query(F.data == "date:custom", TxFlow.amount)
+async def cb_datecustom(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(TxFlow.date)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="date:back")],
+            [BACK],
+        ]
+    )
+    await show(
+        cb, "Введите дату, например 10.10.2026 или 10.10 (текущий год):", kb
+    )
+
+
+@router.callback_query(F.data == "date:back", TxFlow.date)
+async def cb_dateback(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(TxFlow.amount)
+    d = await state.get_data()
+    await show(cb, amount_text(d), amount_kb(d))
+
+
+@router.message(TxFlow.date, F.text)
+async def msg_date(m: Message, state: FSMContext):
+    res = parse_date(m.text)
+    if res is None:
+        await m.answer(
+            "Не понял дату или она в будущем. Пример: 10.10.2026 или 10.10"
+        )
+        return
+    await state.update_data(date=res.isoformat())
+    await state.set_state(TxFlow.amount)
+    d = await state.get_data()
+    await m.answer(amount_text(d), reply_markup=amount_kb(d))
 
 
 @router.message(TxFlow.amount, F.text)
@@ -267,7 +368,10 @@ async def msg_amount(m: Message, state: FSMContext):
             [BACK],
         ]
     )
-    await m.answer(f"Сумма: {fmt(amount)}\n{prompt}", reply_markup=kb)
+    await m.answer(
+        f"📅 Дата: {human_date(d.get('date'))}\nСумма: {fmt(amount)}\n{prompt}",
+        reply_markup=kb,
+    )
 
 
 async def save_tx(event, state: FSMContext, note):
@@ -279,7 +383,9 @@ async def save_tx(event, state: FSMContext, note):
             d["cat_id"],
             d["amount"],
             note,
-            now().strftime("%Y-%m-%d %H:%M:%S"),
+            f"{d['date']} 12:00:00"
+            if d.get("date")
+            else now().strftime("%Y-%m-%d %H:%M:%S"),
         ),
     )
     await state.clear()
@@ -287,6 +393,7 @@ async def save_tx(event, state: FSMContext, note):
     sign = "−" if d["kind"] == "expense" else "+"
     text = (
         f"✅ Сохранено: {d['cat_name']} {sign}{fmt(d['amount'])}"
+        + (f"\n📅 {human_date(d['date'])}" if d.get("date") else "")
         + (f"\n📝 {note}" if note else "")
         + f"\n\nСегодня: расходы {fmt(t['expense'])}, доходы {fmt(t['income'])}"
     )
