@@ -1,592 +1,646 @@
-import asyncio
+"""
+Telegram-бот учёта расходов и доходов.
+Меню: Расходы, Доходы, Статистика, История, Настройки.
+Хранение: SQLite (файл budget.db). Напоминание каждый день (по умолчанию 21:00).
+
+Запуск:
+    pip install -r requirements.txt
+    BOT_TOKEN=123:ABC python bot.py
+"""
+import io
 import logging
-import math
 import os
 import sqlite3
-from datetime import date, datetime, timedelta
+from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
-from aiogram import Bot, Dispatcher, F, Router
-from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import Command, CommandStart
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import (
-    CallbackQuery,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Message,
-)
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-
-
-# ---------- Настройки (из файла .env или переменных окружения) ----------
-def load_env(path=".env"):
-    if not os.path.exists(path):
-        return
-    with open(path, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
-
-
-load_env()
-TOKEN = os.getenv("BOT_TOKEN", "")
-OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)
-DB_PATH = os.getenv("DB_PATH", "expenses.db")
-TIMEZONE = os.getenv("TIMEZONE", "UTC")
-CURRENCY = os.getenv("CURRENCY", "")
-REMINDER_HOUR = int(os.getenv("REMINDER_HOUR", "21"))  # -1 = без напоминаний
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
+from openpyxl import Workbook
+from openpyxl.styles import Font
+from telegram import InlineKeyboardButton as Btn
+from telegram import InlineKeyboardMarkup as Markup
+from telegram import ReplyKeyboardMarkup, Update
+from telegram.error import BadRequest
+from telegram.ext import (
+    Application,
+    ApplicationHandlerStop,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    Defaults,
+    MessageHandler,
+    TypeHandler,
+    filters,
 )
 
-KIND_TITLE = {"expense": "Расходы", "income": "Доходы"}
-DEFAULT_CATEGORIES = {
-    "expense": ["Еда", "Транспорт", "Доп. расходы", "Непредвиденные", "Кредит"],
-    "income": ["Фикс", "KPI", "Прочее"],
-}
+# ================= НАСТРОЙКИ =================
+BOT_TOKEN = os.getenv("BOT_TOKEN", "ВСТАВЬ_ТОКЕН_ОТ_BOTFATHER")
+TZ = ZoneInfo(os.getenv("TZ_NAME", "Europe/Moscow"))  # твой часовой пояс
+DB_PATH = os.getenv("DB_PATH", "budget.db")
+# Если хочешь, чтобы бот работал только для тебя, укажи свой Telegram ID
+# (узнать можно у бота @userinfobot): ALLOWED_USERS=123456789
+ALLOWED = {int(x) for x in os.getenv("ALLOWED_USERS", "").replace(" ", "").split(",") if x}
+# =============================================
+
+logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
+log = logging.getLogger("budget-bot")
+
+DEFAULT_EXPENSE = [
+    "🍽 Еда", "🍕 Доп. еда", "🚕 Транспорт", "👕 Одежда", "💳 Оплата кредита",
+    "⚠️ Непредвиденные расходы", "🏠 Жильё и коммуналка", "📱 Связь и интернет",
+    "💊 Здоровье", "🎬 Развлечения",
+]
+DEFAULT_INCOME = ["💼 Зарплата", "💵 Подработка", "🎁 Подарки", "➕ Другое"]
+
+MAIN_KB = ReplyKeyboardMarkup(
+    [["➖ Расходы", "➕ Доходы"], ["📊 Статистика", "🕘 История"], ["⚙️ Настройки"]],
+    resize_keyboard=True,
+)
+MENU_BUTTONS = {"➖ Расходы", "➕ Доходы", "📊 Статистика", "🕘 История", "⚙️ Настройки"}
+CANCEL_KB = Markup([[Btn("❌ Отмена", callback_data="cancel")]])
 
 
-# ---------- База данных ----------
-def run(sql, args=()):
+# ================= БАЗА ДАННЫХ =================
+def run(sql, args=(), fetch=None):
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     try:
         cur = conn.execute(sql, args)
-        rows = cur.fetchall()
         conn.commit()
-        return rows
+        if fetch == "one":
+            return cur.fetchone()
+        if fetch == "all":
+            return cur.fetchall()
+        return cur.lastrowid
     finally:
         conn.close()
 
 
 def init_db():
-    run(
-        """CREATE TABLE IF NOT EXISTS categories (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            kind TEXT NOT NULL,
-            name TEXT NOT NULL,
-            active INTEGER NOT NULL DEFAULT 1,
-            UNIQUE(kind, name)
-        )"""
-    )
-    run(
-        """CREATE TABLE IF NOT EXISTS transactions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            kind TEXT NOT NULL,
-            category_id INTEGER NOT NULL,
-            amount REAL NOT NULL,
-            note TEXT,
-            created_at TEXT NOT NULL
-        )"""
-    )
-    if not run("SELECT 1 FROM categories LIMIT 1"):
-        for kind, names in DEFAULT_CATEGORIES.items():
-            for name in names:
-                run("INSERT INTO categories(kind, name) VALUES(?, ?)", (kind, name))
+    run("""CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        currency TEXT DEFAULT '₽',
+        remind_on INTEGER DEFAULT 1,
+        remind_time TEXT DEFAULT '21:00',
+        budget REAL DEFAULT 0)""")
+    run("""CREATE TABLE IF NOT EXISTS categories (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER, type TEXT, name TEXT, archived INTEGER DEFAULT 0)""")
+    run("""CREATE TABLE IF NOT EXISTS entries (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER, type TEXT, category_id INTEGER,
+        amount REAL, comment TEXT, date TEXT, created_at TEXT)""")
+    run("CREATE INDEX IF NOT EXISTS idx_entries ON entries(user_id, date)")
 
 
-# ---------- Вспомогательные функции ----------
-def now():
-    return datetime.now(ZoneInfo(TIMEZONE))
+def ensure_user(uid):
+    run("INSERT OR IGNORE INTO users(user_id) VALUES (?)", (uid,))
+    if not run("SELECT 1 FROM categories WHERE user_id=? LIMIT 1", (uid,), "one"):
+        for n in DEFAULT_EXPENSE:
+            run("INSERT INTO categories(user_id,type,name) VALUES (?,?,?)", (uid, "e", n))
+        for n in DEFAULT_INCOME:
+            run("INSERT INTO categories(user_id,type,name) VALUES (?,?,?)", (uid, "i", n))
 
 
-def fmt(x):
-    s = f"{x:,.2f}".replace(",", " ")
-    if s.endswith(".00"):
-        s = s[:-3]
-    return f"{s} {CURRENCY}".strip()
+def get_user(uid):
+    return run("SELECT * FROM users WHERE user_id=?", (uid,), "one")
 
 
-def parse_amount(text):
+# ================= УТИЛИТЫ =================
+def today():
+    return datetime.now(TZ).date()
+
+
+def fmt(n):
+    n = round(float(n), 2)
+    if n == int(n):
+        s = f"{int(n):,}"
+    else:
+        s = f"{n:,.2f}".rstrip("0").rstrip(".")
+    return s.replace(",", " ")
+
+
+def parse_amount(text, allow_zero=False):
+    t = text.replace(" ", "").replace("\u00a0", "").replace(",", ".")
     try:
-        v = float(text.replace(" ", "").replace(",", "."))
+        v = float(t)
     except ValueError:
         return None
-    if not math.isfinite(v) or v <= 0:
+    if v < 0 or (v == 0 and not allow_zero) or v >= 1e12:
         return None
-    return round(v, 2)
+    return v
 
 
 def parse_date(text):
-    parts = text.strip().replace("/", ".").replace("-", ".").split(".")
-    today = now().date()
+    t = text.strip().replace("/", ".").replace("-", ".")
+    for f in ("%d.%m.%Y", "%d.%m.%y"):
+        try:
+            return datetime.strptime(t, f).date()
+        except ValueError:
+            pass
     try:
-        if len(parts) == 2:
-            d, m, y = int(parts[0]), int(parts[1]), today.year
-        elif len(parts) == 3:
-            a, b, c = parts
-            if len(a) == 4:
-                y, m, d = int(a), int(b), int(c)
-            else:
-                d, m, y = int(a), int(b), int(c)
-                if y < 100:
-                    y += 2000
-        else:
-            return None
-        res = date(y, m, d)
+        d = datetime.strptime(f"{t}.{today().year}", "%d.%m.%Y").date()
+        if d > today():
+            d = d.replace(year=d.year - 1)
+        return d
     except ValueError:
         return None
-    if res > today:
-        return None
-    return res
 
 
-def human_date(iso):
-    if not iso:
-        return "сегодня"
-    return date.fromisoformat(iso).strftime("%d.%m.%Y")
+def reset(context):
+    context.user_data.pop("mode", None)
+    context.user_data.pop("draft", None)
+    context.user_data.pop("newcat_type", None)
 
 
-def period_start(code):
-    n = now().replace(hour=0, minute=0, second=0, microsecond=0)
-    if code == "week":
-        n -= timedelta(days=n.weekday())
-    elif code == "month":
-        n = n.replace(day=1)
-    elif code == "year":
-        n = n.replace(month=1, day=1)
-    return n.strftime("%Y-%m-%d %H:%M:%S")
-
-
-PERIOD_TITLE = {
-    "today": "сегодня",
-    "week": "эту неделю",
-    "month": "этот месяц",
-    "year": "этот год",
-}
-
-
-def totals_since(start):
-    rows = run(
-        "SELECT kind, SUM(amount) AS s FROM transactions WHERE created_at >= ? GROUP BY kind",
-        (start,),
-    )
-    res = {"expense": 0.0, "income": 0.0}
-    for r in rows:
-        res[r["kind"]] = r["s"] or 0.0
-    return res
-
-
-async def show(event, text, kb=None):
-    if isinstance(event, CallbackQuery):
+async def show(context, chat_id, text, kb=None, q=None):
+    """Редактирует сообщение (если нажата кнопка) или шлёт новое."""
+    if q:
         try:
-            await event.message.edit_text(text, reply_markup=kb)
-        except TelegramBadRequest:
+            await q.edit_message_text(text, reply_markup=kb)
+        except BadRequest:
             pass
-        await event.answer()
+        return
+    await context.bot.send_message(chat_id, text, reply_markup=kb)
+
+
+# ================= ДОСТУП =================
+async def gatekeeper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if ALLOWED and user and user.id not in ALLOWED:
+        raise ApplicationHandlerStop
+
+
+# ================= НАПОМИНАНИЯ =================
+async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
+    uid = context.job.chat_id
+    u = get_user(uid)
+    if not u or not u["remind_on"]:
+        return
+    n = run("SELECT COUNT(*) AS n FROM entries WHERE user_id=? AND date=?",
+            (uid, today().isoformat()), "one")["n"]
+    if n == 0:
+        text = "🔔 Напоминание: внеси сегодняшние расходы и доходы."
     else:
-        await event.answer(text, reply_markup=kb)
+        text = f"🔔 Сегодня уже записей: {n}. Всё внесено?"
+    kb = Markup([
+        [Btn("➖ Внести расход", callback_data="menu:e"), Btn("➕ Внести доход", callback_data="menu:i")],
+        [Btn("✅ Всё внёс / трат не было", callback_data="rem:ok")],
+    ])
+    await context.bot.send_message(uid, text, reply_markup=kb)
 
 
-# ---------- Клавиатуры ----------
-BACK = InlineKeyboardButton(text="⬅️ В меню", callback_data="menu")
+def schedule_reminder(job_queue, uid):
+    for j in job_queue.get_jobs_by_name(f"rem_{uid}"):
+        j.schedule_removal()
+    u = get_user(uid)
+    if not u or not u["remind_on"]:
+        return
+    h, m = map(int, u["remind_time"].split(":"))
+    job_queue.run_daily(reminder_job, time=time(h, m, tzinfo=TZ), chat_id=uid, name=f"rem_{uid}")
 
 
-def with_back(builder, back=BACK):
-    markup = builder.as_markup()
-    return InlineKeyboardMarkup(inline_keyboard=markup.inline_keyboard + [[back]])
+async def post_init(app: Application):
+    for r in run("SELECT user_id FROM users", fetch="all"):
+        schedule_reminder(app.job_queue, r["user_id"])
 
 
-def main_kb():
-    b = InlineKeyboardBuilder()
-    b.button(text="📊 Статистика", callback_data="stats")
-    b.button(text="💸 Расходы", callback_data="add:expense")
-    b.button(text="💰 Доходы", callback_data="add:income")
-    b.button(text="⚙️ Настройки", callback_data="settings")
-    b.adjust(1, 2, 1)
-    return b.as_markup()
-
-
-def cats_kb(kind, prefix):
-    rows = run(
-        "SELECT id, name FROM categories WHERE kind=? AND active=1 ORDER BY id",
-        (kind,),
+# ================= /start =================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    ensure_user(uid)
+    reset(context)
+    schedule_reminder(context.application.job_queue, uid)
+    await update.message.reply_text(
+        "Привет! Я веду учёт твоих расходов и доходов.\n\n"
+        "➖ Расходы / ➕ Доходы: выбери категорию, сумму, комментарий и дату\n"
+        "📊 Статистика: итоги за день, неделю, месяц, год\n"
+        "🕘 История: последние записи, можно удалить\n"
+        "⚙️ Настройки: свои категории, напоминание, лимит на месяц, экспорт в Excel\n\n"
+        "Каждый день в 21:00 пришлю напоминание (время можно поменять).",
+        reply_markup=MAIN_KB,
     )
-    b = InlineKeyboardBuilder()
+
+
+# ================= ВНЕСЕНИЕ ЗАПИСИ =================
+def cat_keyboard(uid, t):
+    rows = run("SELECT id,name FROM categories WHERE user_id=? AND type=? AND archived=0 ORDER BY id",
+               (uid, t), "all")
+    kb, row = [], []
     for r in rows:
-        b.button(text=r["name"], callback_data=f"{prefix}:{r['id']}")
-    b.adjust(2)
-    return with_back(b)
+        row.append(Btn(r["name"], callback_data=f"cat:{t}:{r['id']}"))
+        if len(row) == 2:
+            kb.append(row)
+            row = []
+    if row:
+        kb.append(row)
+    kb.append([Btn("❌ Отмена", callback_data="cancel")])
+    return Markup(kb), len(rows)
 
 
-# ---------- Состояния ----------
-class TxFlow(StatesGroup):
-    amount = State()
-    note = State()
-    date = State()
+async def send_categories(context, chat_id, uid, t):
+    reset(context)
+    kb, n = cat_keyboard(uid, t)
+    if n == 0:
+        await context.bot.send_message(chat_id, "Категорий нет. Добавь их в ⚙️ Настройки.")
+        return
+    title = "расходов" if t == "e" else "доходов"
+    await context.bot.send_message(chat_id, f"Выбери категорию {title}:", reply_markup=kb)
 
 
-class CatFlow(StatesGroup):
-    name = State()
+def date_keyboard():
+    t = today()
+    y, b = t - timedelta(days=1), t - timedelta(days=2)
+    return Markup([
+        [Btn(f"Сегодня ({t:%d.%m})", callback_data="d:0")],
+        [Btn(f"Вчера ({y:%d.%m})", callback_data="d:1"), Btn(f"Позавчера ({b:%d.%m})", callback_data="d:2")],
+        [Btn("📅 Другая дата", callback_data="d:x")],
+        [Btn("❌ Отмена", callback_data="cancel")],
+    ])
 
 
-# ---------- Роутеры ----------
-public = Router()
-router = Router()
-router.message.filter(F.from_user.id == OWNER_ID)
-router.callback_query.filter(F.from_user.id == OWNER_ID)
+async def ask_date(context, chat_id):
+    context.user_data["mode"] = None
+    await context.bot.send_message(chat_id, "За какую дату внести?", reply_markup=date_keyboard())
 
 
-@public.message(Command("id"))
-async def cmd_id(m: Message):
-    await m.answer(f"Ваш Telegram ID: {m.from_user.id}")
+async def finish_entry(context, uid, chat_id, d):
+    draft = context.user_data.get("draft")
+    if not draft or "amount" not in draft:
+        reset(context)
+        await context.bot.send_message(chat_id, "Сессия устарела, начни заново.", reply_markup=MAIN_KB)
+        return
+    run("""INSERT INTO entries(user_id,type,category_id,amount,comment,date,created_at)
+           VALUES (?,?,?,?,?,?,?)""",
+        (uid, draft["type"], draft["cat"], draft["amount"], draft.get("comment", ""),
+         d.isoformat(), datetime.now(TZ).isoformat()))
+    cat = run("SELECT name FROM categories WHERE id=?", (draft["cat"],), "one")["name"]
+    cur = get_user(uid)["currency"]
+    sign = "➖ Расход" if draft["type"] == "e" else "➕ Доход"
+    lines = ["✅ Записано", f"{sign}: {fmt(draft['amount'])} {cur}", f"Категория: {cat}", f"Дата: {d:%d.%m.%Y}"]
+    if draft.get("comment"):
+        lines.append(f"Комментарий: {draft['comment']}")
+    if draft["type"] == "e":
+        lines += budget_lines(uid, d)
+    reset(context)
+    await context.bot.send_message(chat_id, "\n".join(lines), reply_markup=MAIN_KB)
 
 
-# --- Меню ---
-@router.message(CommandStart())
-async def cmd_start(m: Message, state: FSMContext):
-    await state.clear()
-    await m.answer("Главное меню:", reply_markup=main_kb())
+def month_expense(uid):
+    start = today().replace(day=1).isoformat()
+    r = run("SELECT COALESCE(SUM(amount),0) AS s FROM entries WHERE user_id=? AND type='e' AND date>=? AND date<=?",
+            (uid, start, today().isoformat()), "one")
+    return r["s"]
 
 
-@router.callback_query(F.data == "menu")
-async def cb_menu(cb: CallbackQuery, state: FSMContext):
-    await state.clear()
-    t = totals_since(period_start("today"))
-    text = (
-        "Главное меню\n\n"
-        f"Сегодня: расходы {fmt(t['expense'])}, доходы {fmt(t['income'])}"
-    )
-    await show(cb, text, main_kb())
+def budget_lines(uid, d=None):
+    u = get_user(uid)
+    if not u["budget"] or (d and d.replace(day=1) != today().replace(day=1)):
+        return []
+    spent, limit = month_expense(uid), u["budget"]
+    pct = spent / limit * 100
+    line = f"\n💰 Лимит месяца: {fmt(spent)} из {fmt(limit)} {u['currency']} ({pct:.0f}%)"
+    if pct >= 100:
+        line += "\n🚨 Лимит превышен!"
+    elif pct >= 80:
+        line += "\n⚠️ Осталось меньше 20% лимита"
+    return [line]
 
 
-# --- Добавление записи ---
-@router.callback_query(F.data.startswith("add:"))
-async def cb_add(cb: CallbackQuery, state: FSMContext):
-    await state.clear()
-    kind = cb.data.split(":")[1]
-    await show(cb, f"{KIND_TITLE[kind]}: выберите категорию", cats_kb(kind, "tx"))
+# ================= СТАТИСТИКА =================
+def period_range(key):
+    t = today()
+    if key == "today":
+        return t, t, "Сегодня"
+    if key == "week":
+        return t - timedelta(days=t.weekday()), t, "Эта неделя"
+    if key == "month":
+        return t.replace(day=1), t, "Этот месяц"
+    if key == "prev":
+        end = t.replace(day=1) - timedelta(days=1)
+        return end.replace(day=1), end, "Прошлый месяц"
+    return t.replace(month=1, day=1), t, "Этот год"
 
 
-@router.callback_query(F.data.startswith("tx:"))
-async def cb_tx(cb: CallbackQuery, state: FSMContext):
-    cat_id = int(cb.data.split(":")[1])
-    rows = run("SELECT id, kind, name FROM categories WHERE id=?", (cat_id,))
+def stats_kb(active):
+    def b(label, key):
+        return Btn(("• " if key == active else "") + label, callback_data=f"st:{key}")
+    return Markup([
+        [b("Сегодня", "today"), b("Неделя", "week"), b("Месяц", "month")],
+        [b("Прошлый месяц", "prev"), b("Год", "year")],
+    ])
+
+
+def build_stats(uid, key):
+    start, end, title = period_range(key)
+    cur = get_user(uid)["currency"]
+    rows = run("""SELECT e.type AS type, c.name AS name, SUM(e.amount) AS s
+                  FROM entries e JOIN categories c ON c.id = e.category_id
+                  WHERE e.user_id=? AND e.date BETWEEN ? AND ?
+                  GROUP BY e.type, c.id ORDER BY s DESC""",
+               (uid, start.isoformat(), end.isoformat()), "all")
+    exp = [(r["name"], r["s"]) for r in rows if r["type"] == "e"]
+    inc = [(r["name"], r["s"]) for r in rows if r["type"] == "i"]
+    te, ti = sum(s for _, s in exp), sum(s for _, s in inc)
+    period = f"{start:%d.%m.%Y}" if start == end else f"{start:%d.%m.%Y} – {end:%d.%m.%Y}"
+    lines = [f"📊 {title}", period, ""]
     if not rows:
-        await cb.answer("Категория не найдена", show_alert=True)
-        return
-    c = rows[0]
-    await state.set_state(TxFlow.amount)
-    await state.update_data(
-        cat_id=c["id"], kind=c["kind"], cat_name=c["name"], date=None
-    )
-    d = await state.get_data()
-    await show(cb, amount_text(d), amount_kb(d))
+        lines.append("Записей за этот период нет.")
+        return "\n".join(lines)
+    lines += [f"➖ Расходы: {fmt(te)} {cur}", f"➕ Доходы: {fmt(ti)} {cur}",
+              f"💼 Баланс: {'+' if ti - te >= 0 else '−'}{fmt(abs(ti - te))} {cur}"]
+    days = (end - start).days + 1
+    if days > 1 and te:
+        lines.append(f"📆 В среднем в день: {fmt(te / days)} {cur}")
+    if exp:
+        lines += ["", "Расходы по категориям:"]
+        for name, s in exp:
+            share = s / te
+            bar = "█" * round(share * 10) + "░" * (10 - round(share * 10))
+            lines.append(f"{name}\n{bar} {fmt(s)} ({share * 100:.0f}%)")
+    if inc:
+        lines += ["", "Доходы по категориям:"]
+        for name, s in inc:
+            lines.append(f"{name}: {fmt(s)}")
+    if key == "month":
+        lines += budget_lines(uid)
+    return "\n".join(lines)
 
 
-def amount_text(d):
-    return f"{d['cat_name']}\n📅 Дата: {human_date(d.get('date'))}\n\nВведите сумму:"
-
-
-def amount_kb(d):
-    row = [
-        InlineKeyboardButton(text="📅 Вчера", callback_data="date:yesterday"),
-        InlineKeyboardButton(text="📅 Другая дата", callback_data="date:custom"),
-    ]
-    rows = [row]
-    if d.get("date"):
-        rows.append(
-            [InlineKeyboardButton(text="📅 Сегодня", callback_data="date:today")]
-        )
-    rows.append([BACK])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-@router.callback_query(F.data == "date:yesterday", TxFlow.amount)
-async def cb_yesterday(cb: CallbackQuery, state: FSMContext):
-    y = (now().date() - timedelta(days=1)).isoformat()
-    await state.update_data(date=y)
-    d = await state.get_data()
-    await show(cb, amount_text(d), amount_kb(d))
-
-
-@router.callback_query(F.data == "date:today", TxFlow.amount)
-async def cb_today(cb: CallbackQuery, state: FSMContext):
-    await state.update_data(date=None)
-    d = await state.get_data()
-    await show(cb, amount_text(d), amount_kb(d))
-
-
-@router.callback_query(F.data == "date:custom", TxFlow.amount)
-async def cb_datecustom(cb: CallbackQuery, state: FSMContext):
-    await state.set_state(TxFlow.date)
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="date:back")],
-            [BACK],
-        ]
-    )
-    await show(
-        cb, "Введите дату, например 10.10.2026 или 10.10 (текущий год):", kb
-    )
-
-
-@router.callback_query(F.data == "date:back", TxFlow.date)
-async def cb_dateback(cb: CallbackQuery, state: FSMContext):
-    await state.set_state(TxFlow.amount)
-    d = await state.get_data()
-    await show(cb, amount_text(d), amount_kb(d))
-
-
-@router.message(TxFlow.date, F.text)
-async def msg_date(m: Message, state: FSMContext):
-    res = parse_date(m.text)
-    if res is None:
-        await m.answer(
-            "Не понял дату или она в будущем. Пример: 10.10.2026 или 10.10"
-        )
-        return
-    await state.update_data(date=res.isoformat())
-    await state.set_state(TxFlow.amount)
-    d = await state.get_data()
-    await m.answer(amount_text(d), reply_markup=amount_kb(d))
-
-
-@router.message(TxFlow.amount, F.text)
-async def msg_amount(m: Message, state: FSMContext):
-    amount = parse_amount(m.text)
-    if amount is None:
-        await m.answer("Не понял сумму. Введите число, например 25000 или 12.5")
-        return
-    await state.update_data(amount=amount)
-    await state.set_state(TxFlow.note)
-    d = await state.get_data()
-    if d["kind"] == "income":
-        prompt = "Комментарий (например, название KPI) или нажмите «Пропустить»:"
-    else:
-        prompt = "Комментарий (необязательно) или нажмите «Пропустить»:"
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="Пропустить", callback_data="skipnote")],
-            [BACK],
-        ]
-    )
-    await m.answer(
-        f"📅 Дата: {human_date(d.get('date'))}\nСумма: {fmt(amount)}\n{prompt}",
-        reply_markup=kb,
-    )
-
-
-async def save_tx(event, state: FSMContext, note):
-    d = await state.get_data()
-    run(
-        "INSERT INTO transactions(kind, category_id, amount, note, created_at) VALUES(?,?,?,?,?)",
-        (
-            d["kind"],
-            d["cat_id"],
-            d["amount"],
-            note,
-            f"{d['date']} 12:00:00"
-            if d.get("date")
-            else now().strftime("%Y-%m-%d %H:%M:%S"),
-        ),
-    )
-    await state.clear()
-    t = totals_since(period_start("today"))
-    sign = "−" if d["kind"] == "expense" else "+"
-    text = (
-        f"✅ Сохранено: {d['cat_name']} {sign}{fmt(d['amount'])}"
-        + (f"\n📅 {human_date(d['date'])}" if d.get("date") else "")
-        + (f"\n📝 {note}" if note else "")
-        + f"\n\nСегодня: расходы {fmt(t['expense'])}, доходы {fmt(t['income'])}"
-    )
-    await show(event, text, main_kb())
-
-
-@router.message(TxFlow.note, F.text)
-async def msg_note(m: Message, state: FSMContext):
-    await save_tx(m, state, m.text.strip()[:200])
-
-
-@router.callback_query(F.data == "skipnote", TxFlow.note)
-async def cb_skip(cb: CallbackQuery, state: FSMContext):
-    await save_tx(cb, state, "")
-
-
-# --- Статистика ---
-@router.callback_query(F.data == "stats")
-async def cb_stats(cb: CallbackQuery, state: FSMContext):
-    await state.clear()
-    b = InlineKeyboardBuilder()
-    b.button(text="Сегодня", callback_data="st:today")
-    b.button(text="Неделя", callback_data="st:week")
-    b.button(text="Месяц", callback_data="st:month")
-    b.button(text="Год", callback_data="st:year")
-    b.button(text="🕘 Последние записи", callback_data="recent")
-    b.adjust(2, 2, 1)
-    await show(cb, "Статистика: выберите период", with_back(b))
-
-
-@router.callback_query(F.data.startswith("st:"))
-async def cb_period(cb: CallbackQuery):
-    code = cb.data.split(":")[1]
-    start = period_start(code)
-    rows = run(
-        """SELECT t.kind AS kind, c.name AS name, SUM(t.amount) AS s
-           FROM transactions t JOIN categories c ON c.id = t.category_id
-           WHERE t.created_at >= ?
-           GROUP BY t.kind, c.name ORDER BY s DESC""",
-        (start,),
-    )
-    lines = {"expense": [], "income": []}
-    total = {"expense": 0.0, "income": 0.0}
-    for r in rows:
-        lines[r["kind"]].append(f"  • {r['name']}: {fmt(r['s'])}")
-        total[r["kind"]] += r["s"]
-    text = f"📊 Статистика за {PERIOD_TITLE[code]}\n\n"
-    text += f"💸 Расходы: {fmt(total['expense'])}\n"
-    text += ("\n".join(lines["expense"]) + "\n") if lines["expense"] else "  нет записей\n"
-    text += f"\n💰 Доходы: {fmt(total['income'])}\n"
-    text += ("\n".join(lines["income"]) + "\n") if lines["income"] else "  нет записей\n"
-    text += f"\n⚖️ Баланс: {fmt(total['income'] - total['expense'])}"
-    b = InlineKeyboardBuilder()
-    b.button(text="⬅️ К периодам", callback_data="stats")
-    await show(cb, text, with_back(b))
-
-
-# --- Последние записи (с удалением) ---
-async def show_recent(cb: CallbackQuery):
-    rows = run(
-        """SELECT t.id, t.kind, t.amount, t.note, t.created_at, c.name
-           FROM transactions t JOIN categories c ON c.id = t.category_id
-           ORDER BY t.id DESC LIMIT 8"""
-    )
+# ================= ИСТОРИЯ =================
+def history_view(uid):
+    rows = run("""SELECT e.id, e.type, e.amount, e.comment, e.date, c.name
+                  FROM entries e JOIN categories c ON c.id = e.category_id
+                  WHERE e.user_id=? ORDER BY e.date DESC, e.id DESC LIMIT 10""", (uid,), "all")
     if not rows:
-        b = InlineKeyboardBuilder()
-        await show(cb, "Записей пока нет.", with_back(b))
-        return
-    b = InlineKeyboardBuilder()
+        return "Записей пока нет.", None
+    cur = get_user(uid)["currency"]
+    kb = []
     for r in rows:
-        sign = "−" if r["kind"] == "expense" else "+"
-        date = r["created_at"][5:10]
-        b.button(
-            text=f"🗑 {date} {r['name']} {sign}{fmt(r['amount'])}",
-            callback_data=f"deltx:{r['id']}",
-        )
-    b.adjust(1)
-    await show(cb, "Последние записи. Нажмите, чтобы удалить:", with_back(b))
+        d = datetime.strptime(r["date"], "%Y-%m-%d")
+        sign = "−" if r["type"] == "e" else "+"
+        label = f"🗑 {d:%d.%m} {sign}{fmt(r['amount'])} {cur} {r['name']}"
+        kb.append([Btn(label[:60], callback_data=f"delask:{r['id']}")])
+    return "🕘 Последние записи.\nНажми на запись, чтобы удалить её:", Markup(kb)
 
 
-@router.callback_query(F.data == "recent")
-async def cb_recent(cb: CallbackQuery):
-    await show_recent(cb)
+# ================= НАСТРОЙКИ =================
+def settings_view(uid):
+    u = get_user(uid)
+    rem = f"вкл, в {u['remind_time']}" if u["remind_on"] else "выкл"
+    budget = f"{fmt(u['budget'])} {u['currency']}" if u["budget"] else "не задан"
+    text = (f"⚙️ Настройки\n\n⏰ Напоминание: {rem}\n💰 Лимит расходов на месяц: {budget}\n"
+            f"💱 Валюта: {u['currency']}")
+    kb = Markup([
+        [Btn("➕ Категория расходов", callback_data="set:addcat:e"),
+         Btn("➕ Категория доходов", callback_data="set:addcat:i")],
+        [Btn("🗑 Удалить категорию", callback_data="set:delcat")],
+        [Btn("🔕 Выключить напоминание" if u["remind_on"] else "🔔 Включить напоминание",
+             callback_data="set:rem")],
+        [Btn("🕘 Время напоминания", callback_data="set:time")],
+        [Btn("💰 Лимит на месяц", callback_data="set:budget"), Btn("💱 Валюта", callback_data="set:cur")],
+        [Btn("📥 Экспорт в Excel", callback_data="set:export")],
+    ])
+    return text, kb
 
 
-@router.callback_query(F.data.startswith("deltx:"))
-async def cb_deltx(cb: CallbackQuery):
-    run("DELETE FROM transactions WHERE id=?", (int(cb.data.split(":")[1]),))
-    await show_recent(cb)
+async def send_export(context, uid, chat_id):
+    rows = run("""SELECT e.date, e.type, c.name, e.amount, e.comment
+                  FROM entries e JOIN categories c ON c.id = e.category_id
+                  WHERE e.user_id=? ORDER BY e.date, e.id""", (uid,), "all")
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Операции"
+    ws.append(["Дата", "Тип", "Категория", "Сумма", "Комментарий"])
+    for c in ws[1]:
+        c.font = Font(bold=True)
+    for r in rows:
+        ws.append([datetime.strptime(r["date"], "%Y-%m-%d").date(),
+                   "Расход" if r["type"] == "e" else "Доход", r["name"], r["amount"], r["comment"]])
+    for col, w in zip("ABCDE", (13, 10, 30, 12, 40)):
+        ws.column_dimensions[col].width = w
+    bio = io.BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    await context.bot.send_document(chat_id, document=bio, filename=f"budget_{today():%Y-%m-%d}.xlsx")
 
 
-# --- Настройки: категории ---
-@router.callback_query(F.data == "settings")
-async def cb_settings(cb: CallbackQuery, state: FSMContext):
-    await state.clear()
-    b = InlineKeyboardBuilder()
-    b.button(text="➕ Категория расходов", callback_data="catadd:expense")
-    b.button(text="➕ Категория доходов", callback_data="catadd:income")
-    b.button(text="➖ Удалить категорию расходов", callback_data="catdel:expense")
-    b.button(text="➖ Удалить категорию доходов", callback_data="catdel:income")
-    b.adjust(1)
-    await show(cb, "⚙️ Настройки категорий", with_back(b))
+# ================= ОБРАБОТКА КНОПОК =================
+async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    chat_id = q.message.chat_id
+    ensure_user(uid)
+    p = q.data.split(":")
+    act = p[0]
+
+    if act == "cancel":
+        reset(context)
+        await show(context, chat_id, "Отменено.", q=q)
+
+    elif act == "menu":
+        await send_categories(context, chat_id, uid, p[1])
+
+    elif act == "rem":
+        await show(context, chat_id, "Отлично! 👍", q=q)
+
+    elif act == "cat":
+        t, cid = p[1], int(p[2])
+        row = run("SELECT name FROM categories WHERE id=? AND user_id=?", (cid, uid), "one")
+        if not row:
+            return await show(context, chat_id, "Категория не найдена.", q=q)
+        context.user_data["draft"] = {"type": t, "cat": cid}
+        context.user_data["mode"] = "amount"
+        await show(context, chat_id, f"{row['name']}\n\nВведи сумму (например 250 или 1200.50):", CANCEL_KB, q=q)
+
+    elif act == "skipc":
+        await q.edit_message_reply_markup(None)
+        await ask_date(context, chat_id)
+
+    elif act == "d":
+        if not context.user_data.get("draft"):
+            return await show(context, chat_id, "Сессия устарела, начни заново.", q=q)
+        if p[1] == "x":
+            context.user_data["mode"] = "date"
+            return await show(context, chat_id, "Введи дату: ДД.ММ.ГГГГ или ДД.ММ\nНапример: 03.10", CANCEL_KB, q=q)
+        d = today() - timedelta(days=int(p[1]))
+        await q.edit_message_reply_markup(None)
+        await finish_entry(context, uid, chat_id, d)
+
+    elif act == "st":
+        await show(context, chat_id, build_stats(uid, p[1]), stats_kb(p[1]), q=q)
+
+    elif act == "delask":
+        eid = int(p[1])
+        kb = Markup([[Btn("Да, удалить", callback_data=f"delyes:{eid}"), Btn("Нет", callback_data="hist")]])
+        await show(context, chat_id, "Удалить эту запись?", kb, q=q)
+
+    elif act == "delyes":
+        run("DELETE FROM entries WHERE id=? AND user_id=?", (int(p[1]), uid))
+        text, kb = history_view(uid)
+        await show(context, chat_id, "🗑 Удалено.\n\n" + text, kb, q=q)
+
+    elif act == "hist":
+        text, kb = history_view(uid)
+        await show(context, chat_id, text, kb, q=q)
+
+    elif act == "delcat":
+        run("UPDATE categories SET archived=1 WHERE id=? AND user_id=?", (int(p[1]), uid))
+        text, kb = settings_view(uid)
+        await show(context, chat_id, "🗑 Категория удалена (старые записи сохранены).\n\n" + text, kb, q=q)
+
+    elif act == "cur":
+        run("UPDATE users SET currency=? WHERE user_id=?", (p[1], uid))
+        text, kb = settings_view(uid)
+        await show(context, chat_id, text, kb, q=q)
+
+    elif act == "set":
+        await settings_action(update, context, q, uid, chat_id, p)
 
 
-@router.callback_query(F.data.startswith("catadd:"))
-async def cb_catadd(cb: CallbackQuery, state: FSMContext):
-    kind = cb.data.split(":")[1]
-    await state.set_state(CatFlow.name)
-    await state.update_data(kind=kind)
-    kb = InlineKeyboardMarkup(inline_keyboard=[[BACK]])
-    await show(cb, f"Введите название новой категории ({KIND_TITLE[kind].lower()}):", kb)
+async def settings_action(update, context, q, uid, chat_id, p):
+    sub = p[1]
+    if sub == "back":
+        text, kb = settings_view(uid)
+        await show(context, chat_id, text, kb, q=q)
+    elif sub == "addcat":
+        context.user_data["mode"] = "newcat"
+        context.user_data["newcat_type"] = p[2]
+        await show(context, chat_id,
+                   "Напиши название новой категории. Можно с эмодзи в начале, например: 🐶 Питомец",
+                   CANCEL_KB, q=q)
+    elif sub == "delcat":
+        rows = run("SELECT id,type,name FROM categories WHERE user_id=? AND archived=0 ORDER BY type DESC, id",
+                   (uid,), "all")
+        kb = [[Btn(f"{'➖' if r['type'] == 'e' else '➕'} {r['name']}", callback_data=f"delcat:{r['id']}")]
+              for r in rows]
+        kb.append([Btn("⬅️ Назад", callback_data="set:back")])
+        await show(context, chat_id, "Какую категорию удалить?", Markup(kb), q=q)
+    elif sub == "rem":
+        u = get_user(uid)
+        run("UPDATE users SET remind_on=? WHERE user_id=?", (0 if u["remind_on"] else 1, uid))
+        schedule_reminder(context.application.job_queue, uid)
+        text, kb = settings_view(uid)
+        await show(context, chat_id, text, kb, q=q)
+    elif sub == "time":
+        context.user_data["mode"] = "time"
+        await show(context, chat_id, "Во сколько напоминать? Формат ЧЧ:ММ, например 21:00", CANCEL_KB, q=q)
+    elif sub == "budget":
+        context.user_data["mode"] = "budget"
+        await show(context, chat_id,
+                   "Введи лимит расходов на месяц числом (например 60000).\nЧтобы отключить, отправь 0.",
+                   CANCEL_KB, q=q)
+    elif sub == "cur":
+        kb = Markup([[Btn(c, callback_data=f"cur:{c}") for c in ("₽", "$", "€", "₸", "₴", "Br")]])
+        await show(context, chat_id, "Выбери валюту:", kb, q=q)
+    elif sub == "export":
+        await send_export(context, uid, chat_id)
 
 
-@router.message(CatFlow.name, F.text)
-async def msg_catname(m: Message, state: FSMContext):
-    name = m.text.strip()[:40]
-    if not name:
-        await m.answer("Название не может быть пустым.")
-        return
-    d = await state.get_data()
-    run(
-        """INSERT INTO categories(kind, name, active) VALUES(?, ?, 1)
-           ON CONFLICT(kind, name) DO UPDATE SET active = 1""",
-        (d["kind"], name),
-    )
-    await state.clear()
-    await m.answer(f"✅ Категория «{name}» добавлена.", reply_markup=main_kb())
+# ================= ОБРАБОТКА ТЕКСТА =================
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    uid = update.effective_user.id
+    chat_id = update.effective_chat.id
+    ensure_user(uid)
+
+    if text in MENU_BUTTONS:
+        reset(context)
+        if text == "➖ Расходы":
+            return await send_categories(context, chat_id, uid, "e")
+        if text == "➕ Доходы":
+            return await send_categories(context, chat_id, uid, "i")
+        if text == "📊 Статистика":
+            return await update.message.reply_text(build_stats(uid, "month"), reply_markup=stats_kb("month"))
+        if text == "🕘 История":
+            t, kb = history_view(uid)
+            return await update.message.reply_text(t, reply_markup=kb)
+        t, kb = settings_view(uid)
+        return await update.message.reply_text(t, reply_markup=kb)
+
+    mode = context.user_data.get("mode")
+    draft = context.user_data.get("draft")
+
+    if mode == "amount" and draft:
+        v = parse_amount(text)
+        if v is None:
+            return await update.message.reply_text("Не понял сумму. Введи число, например 250", reply_markup=CANCEL_KB)
+        draft["amount"] = v
+        context.user_data["mode"] = "comment"
+        kb = Markup([[Btn("Пропустить", callback_data="skipc")], [Btn("❌ Отмена", callback_data="cancel")]])
+        return await update.message.reply_text("Добавь комментарий (или нажми «Пропустить»):", reply_markup=kb)
+
+    if mode == "comment" and draft:
+        draft["comment"] = text[:200]
+        return await ask_date(context, chat_id)
+
+    if mode == "date" and draft:
+        d = parse_date(text)
+        if d is None:
+            return await update.message.reply_text("Не понял дату. Формат: ДД.ММ.ГГГГ или ДД.ММ", reply_markup=CANCEL_KB)
+        if d > today():
+            return await update.message.reply_text("Эта дата в будущем. Введи сегодняшнюю или прошедшую.",
+                                                   reply_markup=CANCEL_KB)
+        return await finish_entry(context, uid, chat_id, d)
+
+    if mode == "newcat":
+        name = text[:40]
+        t = context.user_data.get("newcat_type", "e")
+        exists = run("SELECT 1 FROM categories WHERE user_id=? AND type=? AND archived=0 AND lower(name)=lower(?)",
+                     (uid, t, name), "one")
+        if exists:
+            return await update.message.reply_text("Такая категория уже есть. Введи другое название.",
+                                                   reply_markup=CANCEL_KB)
+        run("INSERT INTO categories(user_id,type,name) VALUES (?,?,?)", (uid, t, name))
+        reset(context)
+        s_text, kb = settings_view(uid)
+        await update.message.reply_text(f"✅ Категория «{name}» добавлена.", reply_markup=MAIN_KB)
+        return await update.message.reply_text(s_text, reply_markup=kb)
+
+    if mode == "time":
+        try:
+            h, m = map(int, text.replace(".", ":").split(":"))
+            assert 0 <= h < 24 and 0 <= m < 60
+        except Exception:
+            return await update.message.reply_text("Формат ЧЧ:ММ, например 21:00", reply_markup=CANCEL_KB)
+        run("UPDATE users SET remind_time=?, remind_on=1 WHERE user_id=?", (f"{h:02d}:{m:02d}", uid))
+        schedule_reminder(context.application.job_queue, uid)
+        reset(context)
+        s_text, kb = settings_view(uid)
+        await update.message.reply_text("✅ Время напоминания обновлено.", reply_markup=MAIN_KB)
+        return await update.message.reply_text(s_text, reply_markup=kb)
+
+    if mode == "budget":
+        v = parse_amount(text, allow_zero=True)
+        if v is None:
+            return await update.message.reply_text("Введи число, например 60000 (или 0, чтобы отключить).",
+                                                   reply_markup=CANCEL_KB)
+        run("UPDATE users SET budget=? WHERE user_id=?", (v, uid))
+        reset(context)
+        s_text, kb = settings_view(uid)
+        await update.message.reply_text("✅ Лимит сохранён.", reply_markup=MAIN_KB)
+        return await update.message.reply_text(s_text, reply_markup=kb)
+
+    await update.message.reply_text("Выбери раздел в меню 👇", reply_markup=MAIN_KB)
 
 
-@router.callback_query(F.data.startswith("catdel:"))
-async def cb_catdel(cb: CallbackQuery):
-    kind = cb.data.split(":")[1]
-    await show(
-        cb,
-        "Какую категорию удалить? (история записей сохранится)",
-        cats_kb(kind, "catrm"),
-    )
+async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
+    log.error("Ошибка", exc_info=context.error)
 
 
-@router.callback_query(F.data.startswith("catrm:"))
-async def cb_catrm(cb: CallbackQuery):
-    cat_id = int(cb.data.split(":")[1])
-    rows = run("SELECT name FROM categories WHERE id=?", (cat_id,))
-    run("UPDATE categories SET active = 0 WHERE id=?", (cat_id,))
-    name = rows[0]["name"] if rows else ""
-    await show(cb, f"🗑 Категория «{name}» удалена.", main_kb())
-
-
-# --- Всё остальное ---
-@router.message()
-async def fallback(m: Message):
-    await m.answer("Нажмите /start, чтобы открыть меню.", reply_markup=main_kb())
-
-
-# ---------- Напоминание ----------
-async def reminder_loop(bot: Bot):
-    if REMINDER_HOUR < 0 or not OWNER_ID:
-        return
-    last_day = None
-    while True:
-        n = now()
-        if n.hour == REMINDER_HOUR and last_day != n.date():
-            last_day = n.date()
-            try:
-                await bot.send_message(
-                    OWNER_ID,
-                    "🔔 Не забудьте внести сегодняшние расходы и доходы.",
-                    reply_markup=main_kb(),
-                )
-            except Exception:
-                logging.exception("Не удалось отправить напоминание")
-        await asyncio.sleep(60)
-
-
-async def main():
-    if not TOKEN:
-        raise SystemExit("Не задан BOT_TOKEN (см. файл .env)")
-    if not OWNER_ID:
-        logging.warning(
-            "OWNER_ID не задан: бот отвечает только на /id. "
-            "Отправьте боту /id и впишите число в .env"
-        )
+# ================= ЗАПУСК =================
+def main():
     init_db()
-    bot = Bot(token=TOKEN)
-    dp = Dispatcher()
-    dp.include_router(public)
-    dp.include_router(router)
-    reminder = asyncio.create_task(reminder_loop(bot))
-    try:
-        await dp.start_polling(bot)
-    finally:
-        reminder.cancel()
+    app = (Application.builder().token(BOT_TOKEN)
+           .defaults(Defaults(tzinfo=TZ)).post_init(post_init).build())
+    app.add_handler(TypeHandler(Update, gatekeeper), group=-1)
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(on_button))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_error_handler(on_error)
+    log.info("Бот запущен")
+    app.run_polling()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
